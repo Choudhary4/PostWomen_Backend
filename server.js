@@ -15,7 +15,7 @@ import adminRoutes from './routes/admin.js';
 const app = express();
 
 // Connect to MongoDB
-connectDB();
+await connectDB();
 
 // Middleware
 app.use(helmet());
