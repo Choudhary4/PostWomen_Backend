@@ -1,16 +1,16 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const bodyParser = require('body-parser');
-const helmet = require('helmet');
-const connectDB = require('./config/database');
-const mockServerService = require('./services/mockServerService');
-const webSocketService = require('./services/webSocketService');
-const themeService = require('./services/themeService');
+import express from 'express';
+import cors from 'cors';
+import axios from 'axios';
+import bodyParser from 'body-parser';
+import helmet from 'helmet';
+import connectDB from './config/database.js';
+import mockServerService from './services/mockServerService.js';
+import webSocketService from './services/webSocketService.js';
+import themeService from './services/themeService.js';
 
 // Import authentication routes
-const authRoutes = require('./routes/auth');
-const adminRoutes = require('./routes/admin');
+import authRoutes from './routes/auth.js';
+import adminRoutes from './routes/admin.js';
 
 const app = express();
 
@@ -748,4 +748,4 @@ if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
   });
 }
 
-module.exports = app;
+export default app;

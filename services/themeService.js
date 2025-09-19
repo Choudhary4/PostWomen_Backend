@@ -726,4 +726,5 @@ class ThemeService {
   }
 }
 
-module.exports = new ThemeService();
+const themeService = new ThemeService();
+export default themeService;

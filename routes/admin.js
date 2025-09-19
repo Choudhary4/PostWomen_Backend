@@ -1,11 +1,11 @@
-const express = require('express');
-const User = require('../models/User');
-const { 
+import express from 'express';
+import User from '../models/User.js';
+import { 
   authenticate, 
   requireAdmin, 
   requireOwnershipOrAdmin,
   createRateLimiter 
-} = require('../middleware/auth');
+} from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -590,4 +590,4 @@ router.post('/bulk-actions', authenticate, requireAdmin, adminLimiter, async (re
   }
 });
 
-module.exports = router;
+export default router;

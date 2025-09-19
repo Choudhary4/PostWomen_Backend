@@ -1,4 +1,4 @@
-const path = require('path');
+import path from 'path';
 
 class MockServerService {
   constructor() {
@@ -605,4 +605,5 @@ class MockServerService {
   }
 }
 
-module.exports = new MockServerService();
+const mockServerService = new MockServerService();
+export default mockServerService;
