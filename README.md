@@ -19,7 +19,6 @@ This repository contains the backend services for PostWomen, providing robust AP
 1. Clone the repository:
 ```bash
 git clone https://github.com/Choudhary4/PostWomen_Backend.git
-cd PostWomen_Backend
 ```
 
 2. Install dependencies:
@@ -79,3 +78,4 @@ Give a ⭐️ if this project helped you!
 
 **Note:** This is the backend repository. For the frontend, please visit the corresponding frontend repository.
 ```
+https://github.com/Choudhary4/PostWomen_Frontend
