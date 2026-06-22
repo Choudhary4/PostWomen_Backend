@@ -3,90 +3,78 @@ import cors from 'cors';
 import axios from 'axios';
 import bodyParser from 'body-parser';
 import helmet from 'helmet';
+import { v4 as uuidv4 } from 'uuid';
+import WebSocket from 'ws';
 import connectDB from './config/database.js';
-import mockServerService from './services/mockServerService.js';
-import webSocketService from './services/webSocketService.js';
-import themeService from './services/themeService.js';
-
-// Import authentication routes
 import authRoutes from './routes/auth.js';
-import adminRoutes from './routes/admin.js';
 
 const app = express();
 
-// Connect to MongoDB
+// ─── Connect to MongoDB ────────────────────────────────────────────────────
 await connectDB();
 
-// Middleware
+// ─── Global Middleware ─────────────────────────────────────────────────────
 app.use(helmet());
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Health check endpoint
+// ─── Health Check ──────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.send('🚀 PostWomen Backend is running!'));
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'PostWomen Backend is running' });
+  res.json({ status: 'OK', message: 'PostWomen Backend is healthy' });
 });
 
-// ============ AUTHENTICATION ENDPOINTS ============
-
-// Authentication routes
+// ══════════════════════════════════════════════════════════════════════════
+// 1. AUTH ROUTES
+//    Handles: register, login, profile, change-password, logout
+// ══════════════════════════════════════════════════════════════════════════
 app.use('/api/auth', authRoutes);
 
-// Admin routes
-app.use('/api/admin', adminRoutes);
 
-// ============ END AUTHENTICATION ENDPOINTS ============
-
-// Proxy endpoint to handle API requests
+// ══════════════════════════════════════════════════════════════════════════
+// 2. PROXY
+//    Receives a request config from frontend, forwards it to the real API.
+//    This avoids CORS issues when calling external APIs from the browser.
+//    POST /api/proxy
+// ══════════════════════════════════════════════════════════════════════════
 app.post('/api/proxy', async (req, res) => {
+  const { url, method = 'GET', headers = {}, body, auth } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: 'URL is required' });
+  }
+
+  // Build axios config
+  const config = {
+    method: method.toLowerCase(),
+    url,
+    headers: { ...headers, 'User-Agent': 'PostWomen/1.0' },
+    timeout: 30000,
+    validateStatus: () => true, // Accept all HTTP status codes, don't throw on 4xx/5xx
+  };
+
+  // Attach body for POST, PUT, PATCH
+  if (['post', 'put', 'patch'].includes(method.toLowerCase()) && body) {
+    config.data = body;
+  }
+
+  // Attach authentication header
+  if (auth) {
+    if (auth.type === 'bearer' && auth.token) {
+      config.headers['Authorization'] = `Bearer ${auth.token}`;
+    } else if (auth.type === 'apikey' && auth.key && auth.value) {
+      config.headers[auth.key] = auth.value;
+    } else if (auth.type === 'basic' && auth.username && auth.password) {
+      const b64 = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
+      config.headers['Authorization'] = `Basic ${b64}`;
+    }
+  }
+
   try {
-    const { url, method = 'GET', headers = {}, body, auth } = req.body;
-
-    if (!url) {
-      return res.status(400).json({ error: 'URL is required' });
-    }
-
-    // Prepare axios config
-    const config = {
-      method: method.toLowerCase(),
-      url,
-      headers: {
-        ...headers,
-        'User-Agent': 'Postman-MVP/1.0'
-      },
-      timeout: 30000, // 30 seconds timeout
-      validateStatus: () => true // Accept all status codes
-    };
-
-    // Add body for POST, PUT, PATCH requests
-    if (['post', 'put', 'patch'].includes(method.toLowerCase()) && body) {
-      config.data = body;
-    }
-
-    // Handle authentication
-    if (auth) {
-      switch (auth.type) {
-        case 'bearer':
-          config.headers.Authorization = `Bearer ${auth.token}`;
-          break;
-        case 'apikey':
-          if (auth.key && auth.value) {
-            config.headers[auth.key] = auth.value;
-          }
-          break;
-        case 'basic':
-          if (auth.username && auth.password) {
-            const credentials = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
-            config.headers.Authorization = `Basic ${credentials}`;
-          }
-          break;
-      }
-    }
-
-    const startTime = Date.now();
+    const start = Date.now();
     const response = await axios(config);
-    const duration = Date.now() - startTime;
+    const duration = Date.now() - start;
 
     res.json({
       status: response.status,
@@ -94,657 +82,228 @@ app.post('/api/proxy', async (req, res) => {
       headers: response.headers,
       data: response.data,
       duration,
-      size: JSON.stringify(response.data).length
+      size: JSON.stringify(response.data).length,
+    });
+  } catch (error) {
+    // Network error or timeout
+    res.status(500).json({
+      error: 'Network error or timeout',
+      message: error.message,
+      code: error.code,
+    });
+  }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// 3. MOCK SERVER
+//    Users can create named mock endpoints. Each endpoint has a method,
+//    path, status code, and a JSON response body.
+//    Data is stored in-memory (resets on server restart — by design).
+//
+//    GET    /api/mocks          → list all mock configs
+//    POST   /api/mocks          → create a new mock
+//    PUT    /api/mocks/:id      → update a mock
+//    DELETE /api/mocks/:id      → delete a mock
+//    *      /mock/*             → catch-all: matches incoming request to a mock
+// ══════════════════════════════════════════════════════════════════════════
+
+// In-memory store for mock configurations
+const mockStore = new Map();
+
+// Create a mock
+app.post('/api/mocks', (req, res) => {
+  const { name, method, path, status, responseBody, responseHeaders, delay } = req.body;
+
+  if (!method || !path) {
+    return res.status(400).json({ error: 'method and path are required' });
+  }
+
+  const mock = {
+    id: uuidv4(),
+    name: name || `${method} ${path}`,
+    method: method.toUpperCase(),
+    path: path.startsWith('/') ? path : `/${path}`,
+    status: status || 200,
+    responseBody: responseBody || {},
+    responseHeaders: responseHeaders || { 'Content-Type': 'application/json' },
+    delay: delay || 0,
+    createdAt: new Date().toISOString(),
+    hitCount: 0,
+  };
+
+  mockStore.set(mock.id, mock);
+  res.status(201).json(mock);
+});
+
+// List all mocks
+app.get('/api/mocks', (req, res) => {
+  res.json([...mockStore.values()]);
+});
+
+// Update a mock
+app.put('/api/mocks/:id', (req, res) => {
+  const mock = mockStore.get(req.params.id);
+  if (!mock) return res.status(404).json({ error: 'Mock not found' });
+
+  const updated = { ...mock, ...req.body, id: mock.id };
+  mockStore.set(mock.id, updated);
+  res.json(updated);
+});
+
+// Delete a mock
+app.delete('/api/mocks/:id', (req, res) => {
+  if (!mockStore.has(req.params.id)) return res.status(404).json({ error: 'Mock not found' });
+  mockStore.delete(req.params.id);
+  res.status(204).send();
+});
+
+// Catch-all route: matches incoming requests to a registered mock
+app.use('/mock', async (req, res) => {
+  // Remove the '/mock' prefix to get the actual path being tested
+  const incomingPath = req.originalUrl.replace('/mock', '') || '/';
+  const incomingMethod = req.method.toUpperCase();
+
+  // Find a matching mock
+  const match = [...mockStore.values()].find(
+    (m) => m.method === incomingMethod && m.path === incomingPath
+  );
+
+  if (!match) {
+    return res.status(404).json({
+      error: 'No mock found for this path and method',
+      requested: `${incomingMethod} ${incomingPath}`,
+      available: [...mockStore.values()].map((m) => `${m.method} ${m.path}`),
+    });
+  }
+
+  // Increment hit count
+  match.hitCount += 1;
+  mockStore.set(match.id, match);
+
+  // Apply optional delay
+  if (match.delay > 0) {
+    await new Promise((r) => setTimeout(r, match.delay));
+  }
+
+  res.status(match.status).set(match.responseHeaders).json(match.responseBody);
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4. WEBSOCKET TESTING
+//    The backend acts as a WebSocket CLIENT on behalf of the browser.
+//    Browser sends REST requests → backend opens/manages WS connections.
+//
+//    POST   /api/ws/connect        → connect to a WS URL
+//    POST   /api/ws/:id/send       → send a message
+//    GET    /api/ws/:id/messages   → get message history
+//    DELETE /api/ws/:id            → close connection
+//    GET    /api/ws                → list all connections
+// ══════════════════════════════════════════════════════════════════════════
+
+// In-memory store for WebSocket connections
+const wsConnections = new Map();
+
+// Connect to a WebSocket URL
+app.post('/api/ws/connect', (req, res) => {
+  const { url, name } = req.body;
+
+  if (!url) return res.status(400).json({ error: 'url is required' });
+
+  const id = uuidv4();
+  const messages = [];
+  let status = 'connecting';
+
+  try {
+    const ws = new WebSocket(url);
+
+    ws.on('open', () => {
+      status = 'connected';
+      const conn = wsConnections.get(id);
+      if (conn) conn.status = 'connected';
     });
 
-  } catch (error) {
-    console.error('Proxy request error:', error.message);
-    
-    if (error.response) {
-      // Server responded with error status
-      res.json({
-        status: error.response.status,
-        statusText: error.response.statusText,
-        headers: error.response.headers,
-        data: error.response.data,
-        duration: 0,
-        size: 0
-      });
-    } else if (error.request) {
-      // Request timeout or network error
-      res.status(500).json({
-        error: 'Network error or timeout',
-        message: error.message,
-        code: error.code
-      });
-    } else {
-      // Other errors
-      res.status(500).json({
-        error: 'Request failed',
-        message: error.message
-      });
-    }
+    ws.on('message', (data) => {
+      messages.push({ direction: 'received', data: data.toString(), timestamp: new Date().toISOString() });
+    });
+
+    ws.on('close', () => {
+      status = 'disconnected';
+      const conn = wsConnections.get(id);
+      if (conn) conn.status = 'disconnected';
+    });
+
+    ws.on('error', (err) => {
+      status = 'error';
+      const conn = wsConnections.get(id);
+      if (conn) { conn.status = 'error'; conn.error = err.message; }
+    });
+
+    wsConnections.set(id, { id, name: name || url, url, ws, status, messages, error: null, connectedAt: new Date().toISOString() });
+
+    res.status(201).json({ id, url, name: name || url, status: 'connecting' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create WebSocket connection', message: err.message });
   }
 });
 
-// Collections endpoints (for future implementation with database)
-app.get('/api/collections', (req, res) => {
-  // For MVP, we'll use client-side storage
-  res.json({ message: 'Collections are stored in browser localStorage' });
+// List all connections (without the ws object itself)
+app.get('/api/ws', (req, res) => {
+  const list = [...wsConnections.values()].map(({ ws, ...rest }) => rest);
+  res.json(list);
 });
 
-app.post('/api/collections', (req, res) => {
-  // For MVP, we'll use client-side storage
-  res.json({ message: 'Collections are stored in browser localStorage' });
+// Send a message through a connection
+app.post('/api/ws/:id/send', (req, res) => {
+  const conn = wsConnections.get(req.params.id);
+  if (!conn) return res.status(404).json({ error: 'Connection not found' });
+  if (conn.ws.readyState !== WebSocket.OPEN) return res.status(400).json({ error: 'Connection is not open' });
+
+  const message = typeof req.body.message === 'string' ? req.body.message : JSON.stringify(req.body.message);
+  conn.ws.send(message);
+  conn.messages.push({ direction: 'sent', data: message, timestamp: new Date().toISOString() });
+
+  res.json({ success: true, message: 'Message sent' });
 });
 
-// ============ MOCK SERVER ENDPOINTS ============
-
-// Get all mock configurations
-app.get('/api/mock-configs', (req, res) => {
-  try {
-    const configs = mockServerService.getAllMockConfigs();
-    res.json(configs);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+// Get message history
+app.get('/api/ws/:id/messages', (req, res) => {
+  const conn = wsConnections.get(req.params.id);
+  if (!conn) return res.status(404).json({ error: 'Connection not found' });
+  res.json(conn.messages);
 });
 
-// Create mock configuration
-app.post('/api/mock-configs', (req, res) => {
-  try {
-    const config = mockServerService.createMockConfig(req.body);
-    res.status(201).json(config);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+// Get connection status
+app.get('/api/ws/:id', (req, res) => {
+  const conn = wsConnections.get(req.params.id);
+  if (!conn) return res.status(404).json({ error: 'Connection not found' });
+  const { ws, ...rest } = conn;
+  res.json(rest);
 });
 
-// Update mock configuration
-app.put('/api/mock-configs/:id', (req, res) => {
-  try {
-    const config = mockServerService.updateMockConfig(req.params.id, req.body);
-    if (!config) {
-      return res.status(404).json({ error: 'Mock configuration not found' });
-    }
-    res.json(config);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// Close and delete a connection
+app.delete('/api/ws/:id', (req, res) => {
+  const conn = wsConnections.get(req.params.id);
+  if (!conn) return res.status(404).json({ error: 'Connection not found' });
 
-// Delete mock configuration
-app.delete('/api/mock-configs/:id', (req, res) => {
-  try {
-    const deleted = mockServerService.deleteMockConfig(req.params.id);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Mock configuration not found' });
-    }
-    res.status(204).send();
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add route to mock configuration
-app.post('/api/mock-configs/:id/routes', (req, res) => {
-  try {
-    const route = mockServerService.addRoute(req.params.id, req.body);
-    if (!route) {
-      return res.status(404).json({ error: 'Mock configuration not found' });
-    }
-    res.status(201).json(route);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update route
-app.put('/api/mock-configs/:id/routes/:routeId', (req, res) => {
-  try {
-    const route = mockServerService.updateRoute(req.params.id, req.params.routeId, req.body);
-    if (!route) {
-      return res.status(404).json({ error: 'Route not found' });
-    }
-    res.json(route);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Delete route
-app.delete('/api/mock-configs/:id/routes/:routeId', (req, res) => {
-  try {
-    const deleted = mockServerService.deleteRoute(req.params.id, req.params.routeId);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Route not found' });
-    }
-    res.status(204).send();
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get request logs
-app.get('/api/mock-logs', (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 100;
-    const logs = mockServerService.getRequestLogs(limit);
-    res.json(logs);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Clear request logs
-app.delete('/api/mock-logs', (req, res) => {
-  try {
-    mockServerService.clearRequestLogs();
-    res.status(204).send();
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get mock server statistics
-app.get('/api/mock-stats', (req, res) => {
-  try {
-    const stats = mockServerService.getStatistics();
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get route templates
-app.get('/api/mock-templates', (req, res) => {
-  try {
-    const templates = mockServerService.getRouteTemplates();
-    res.json(templates);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Export mock configurations
-app.get('/api/mock-export', (req, res) => {
-  try {
-    const data = mockServerService.exportMockConfigs();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Import mock configurations
-app.post('/api/mock-import', (req, res) => {
-  try {
-    const result = mockServerService.importMockConfigs(req.body);
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Test mock endpoint
-app.post('/api/mock-test', async (req, res) => {
-  try {
-    const { method, url, body, headers } = req.body;
-    const mockRequest = {
-      method: method || 'GET',
-      path: url,
-      body,
-      headers: headers || {}
-    };
-    
-    const result = await mockServerService.processMockRequest(mockRequest);
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Mock server catch-all route (should be last)
-app.use('/mock/*', async (req, res) => {
-  try {
-    const mockRequest = {
-      method: req.method,
-      path: req.originalUrl,
-      body: req.body,
-      headers: req.headers
-    };
-    
-    const result = await mockServerService.processMockRequest(mockRequest);
-    
-    if (result.success) {
-      // Apply delay if specified
-      const delay = result.response.delay || 0;
-      setTimeout(() => {
-        res.status(result.response.status)
-           .set(result.response.headers)
-           .json(result.response.body);
-      }, delay);
-    } else {
-      res.status(404).json({
-        error: 'Mock endpoint not found',
-        message: result.error,
-        path: req.originalUrl,
-        method: req.method
-      });
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ END MOCK SERVER ENDPOINTS ============
-
-// ============ WEBSOCKET ENDPOINTS ============
-
-// Create WebSocket connection
-app.post('/api/websocket/connections', (req, res) => {
-  try {
-    const result = webSocketService.createConnection(req.body);
-    if (result.success) {
-      res.status(201).json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get all WebSocket connections
-app.get('/api/websocket/connections', (req, res) => {
-  try {
-    const connections = webSocketService.getAllConnections();
-    res.json(connections);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get specific WebSocket connection
-app.get('/api/websocket/connections/:id', (req, res) => {
-  try {
-    const connection = webSocketService.getConnectionInfo(req.params.id);
-    if (!connection) {
-      return res.status(404).json({ error: 'Connection not found' });
-    }
-    res.json(connection);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Send message through WebSocket
-app.post('/api/websocket/connections/:id/send', (req, res) => {
-  try {
-    const { message, messageType } = req.body;
-    const result = webSocketService.sendMessage(req.params.id, message, messageType);
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Close WebSocket connection
-app.post('/api/websocket/connections/:id/close', (req, res) => {
-  try {
-    const { code, reason } = req.body;
-    const result = webSocketService.closeConnection(req.params.id, code, reason);
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Delete WebSocket connection
-app.delete('/api/websocket/connections/:id', (req, res) => {
-  try {
-    const result = webSocketService.deleteConnection(req.params.id);
-    if (result.success) {
-      res.status(204).send();
-    } else {
-      res.status(404).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get message history for connection
-app.get('/api/websocket/connections/:id/messages', (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 100;
-    const messages = webSocketService.getMessageHistory(req.params.id, limit);
-    res.json(messages);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Clear message history for connection
-app.delete('/api/websocket/connections/:id/messages', (req, res) => {
-  try {
-    const result = webSocketService.clearMessageHistory(req.params.id);
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Test WebSocket connection
-app.post('/api/websocket/test', (req, res) => {
-  webSocketService.testConnection(req.body)
-    .then(result => res.json(result))
-    .catch(error => res.status(500).json({ error: error.message }));
-});
-
-// Get WebSocket statistics
-app.get('/api/websocket/stats', (req, res) => {
-  try {
-    const stats = webSocketService.getGlobalStats();
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get WebSocket connection templates
-app.get('/api/websocket/templates', (req, res) => {
-  try {
-    const templates = webSocketService.getConnectionTemplates();
-    res.json(templates);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Export WebSocket data
-app.get('/api/websocket/export', (req, res) => {
-  try {
-    const data = webSocketService.exportConnections();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Import WebSocket data
-app.post('/api/websocket/import', (req, res) => {
-  try {
-    const result = webSocketService.importConnections(req.body);
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Cleanup closed connections
-app.post('/api/websocket/cleanup', (req, res) => {
-  try {
-    const result = webSocketService.cleanup();
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ END WEBSOCKET ENDPOINTS ============
-
-// ============ THEME ENDPOINTS ============
-
-// Get all themes
-app.get('/api/themes', (req, res) => {
-  try {
-    const themes = themeService.getAllThemes();
-    res.json(themes);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get specific theme
-app.get('/api/themes/:id', (req, res) => {
-  try {
-    const theme = themeService.getTheme(req.params.id);
-    if (!theme) {
-      return res.status(404).json({ error: 'Theme not found' });
-    }
-    res.json(theme);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Create custom theme
-app.post('/api/themes', (req, res) => {
-  try {
-    const validation = themeService.validateTheme(req.body);
-    if (!validation.isValid) {
-      return res.status(400).json({ error: 'Validation failed', details: validation.errors });
-    }
-
-    const theme = themeService.createTheme(req.body);
-    res.status(201).json(theme);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update theme
-app.put('/api/themes/:id', (req, res) => {
-  try {
-    const theme = themeService.updateTheme(req.params.id, req.body);
-    if (!theme) {
-      return res.status(404).json({ error: 'Theme not found' });
-    }
-    res.json(theme);
-  } catch (error) {
-    if (error.message.includes('Cannot modify')) {
-      res.status(403).json({ error: error.message });
-    } else {
-      res.status(500).json({ error: error.message });
-    }
-  }
-});
-
-// Delete theme
-app.delete('/api/themes/:id', (req, res) => {
-  try {
-    const deleted = themeService.deleteTheme(req.params.id);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Theme not found' });
-    }
-    res.status(204).send();
-  } catch (error) {
-    if (error.message.includes('Cannot delete')) {
-      res.status(403).json({ error: error.message });
-    } else {
-      res.status(500).json({ error: error.message });
-    }
-  }
-});
-
-// Clone theme
-app.post('/api/themes/:id/clone', (req, res) => {
-  try {
-    const { name } = req.body;
-    const clonedTheme = themeService.cloneTheme(req.params.id, name);
-    if (!clonedTheme) {
-      return res.status(404).json({ error: 'Theme not found' });
-    }
-    res.status(201).json(clonedTheme);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get user preferences
-app.get('/api/themes/users/:userId/preferences', (req, res) => {
-  try {
-    const preferences = themeService.getUserPreferences(req.params.userId);
-    res.json(preferences);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Update user preferences
-app.put('/api/themes/users/:userId/preferences', (req, res) => {
-  try {
-    const preferences = themeService.updateUserPreferences(req.params.userId, req.body);
-    res.json(preferences);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Set active theme for user
-app.post('/api/themes/users/:userId/active', (req, res) => {
-  try {
-    const { themeId } = req.body;
-    const preferences = themeService.setActiveTheme(req.params.userId, themeId);
-    res.json(preferences);
-  } catch (error) {
-    if (error.message === 'Theme not found') {
-      res.status(404).json({ error: error.message });
-    } else {
-      res.status(500).json({ error: error.message });
-    }
-  }
-});
-
-// Get active theme for user
-app.get('/api/themes/users/:userId/active', (req, res) => {
-  try {
-    const theme = themeService.getActiveTheme(req.params.userId);
-    res.json(theme);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Generate CSS variables for theme
-app.get('/api/themes/:id/css', (req, res) => {
-  try {
-    const css = themeService.generateCSSVariables(req.params.id);
-    if (!css) {
-      return res.status(404).json({ error: 'Theme not found' });
-    }
-    res.type('text/css').send(css);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get theme statistics
-app.get('/api/themes/stats', (req, res) => {
-  try {
-    const stats = themeService.getThemeStatistics();
-    res.json(stats);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Export themes
-app.get('/api/themes/export', (req, res) => {
-  try {
-    const data = themeService.exportThemes();
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Import themes
-app.post('/api/themes/import', (req, res) => {
-  try {
-    const result = themeService.importThemes(req.body);
-    if (result.success) {
-      res.json(result);
-    } else {
-      res.status(400).json(result);
-    }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Validate theme
-app.post('/api/themes/validate', (req, res) => {
-  try {
-    const validation = themeService.validateTheme(req.body);
-    res.json(validation);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Clear custom data
-app.delete('/api/themes/custom', (req, res) => {
-  try {
-    const result = themeService.clearCustomData();
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Reset to defaults
-app.post('/api/themes/reset', (req, res) => {
-  try {
-    const result = themeService.resetToDefaults();
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-app.get('/', (req, res) => {
-  res.send('🚀 PostWomen Backend is running!');
+  conn.ws.close();
+  wsConnections.delete(req.params.id);
+  res.status(204).send();
 });
 
 
-// ============ END THEME ENDPOINTS ============
-
-// Start server
+// ─── Start Server ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 9000;
 
-// Only start server if not in Vercel environment
 if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
   app.listen(PORT, () => {
-    console.log(`🚀 PostWomen Backend running on port ${PORT}`);
-    console.log(`📡 Proxy endpoint: http://localhost:${PORT}/api/proxy`);
-    console.log(`🎭 Mock Server: http://localhost:${PORT}/mock/*`);
-    console.log(`🔌 WebSocket Testing: http://localhost:${PORT}/api/websocket/*`);
-    console.log(`🎨 Theme Management: http://localhost:${PORT}/api/themes/*`);
-    console.log(`🔐 Authentication: http://localhost:${PORT}/api/auth/*`);
-    console.log(`👨‍💼 Admin Panel: http://localhost:${PORT}/api/admin/*`);
-    console.log(`\n🎯 Phase 3 Professional Features:`);
-    console.log(`   ✅ Mock Server with dynamic data generation`);
-    console.log(`   ✅ WebSocket Testing with real-time messaging`);
-    console.log(`   ✅ Dark Mode & Themes with user preferences`);
-    console.log(`   ✅ User Authentication with JWT & MongoDB`);
-    console.log(`   ✅ Admin Panel with role-based access control`);
+    console.log(`\n🚀 PostWomen Backend running on http://localhost:${PORT}`);
+    console.log(`\n   Routes:`);
+    console.log(`   🔐 Auth      → /api/auth/*`);
+    console.log(`   🔄 Proxy     → POST /api/proxy`);
+    console.log(`   🎭 Mocks     → /api/mocks  |  /mock/*`);
+    console.log(`   🔌 WebSocket → /api/ws/*\n`);
   });
 }
 

@@ -1,480 +1,176 @@
 import express from 'express';
-import bcrypt from 'bcryptjs';
-import crypto from 'crypto';
 import User from '../models/User.js';
-import { 
-  authenticate, 
-  requireAdmin, 
-  requireOwnershipOrAdmin,
-  generateToken,
-  createRateLimiter 
-} from '../middleware/auth.js';
+import { authenticate, generateToken, createRateLimiter } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// Rate limiters
-const loginLimiter = createRateLimiter(15 * 60 * 1000, 5); // 5 attempts per 15 minutes
-const registerLimiter = createRateLimiter(60 * 60 * 1000, 3); // 3 registrations per hour
-const generalLimiter = createRateLimiter(15 * 60 * 1000, 100); // 100 requests per 15 minutes
+// Rate limiters to prevent brute-force attacks
+const loginLimiter    = createRateLimiter(15 * 60 * 1000, 10); // 10 attempts / 15 min
+const registerLimiter = createRateLimiter(60 * 60 * 1000, 5);  // 5 registrations / hour
 
-// @route   POST /api/auth/register
-// @desc    Register a new user
-// @access  Public
+// ─── POST /api/auth/register ───────────────────────────────────────────────
+// Create a new user account
 router.post('/register', registerLimiter, async (req, res) => {
   try {
     const { username, email, password, firstName, lastName } = req.body;
 
-    // Validation
     if (!username || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Username, email, and password are required.',
-        error: 'MISSING_REQUIRED_FIELDS'
-      });
+      return res.status(400).json({ success: false, message: 'username, email, and password are required.' });
     }
 
-    // Check if user already exists
-    const existingUser = await User.findOne({
-      $or: [
-        { email: email.toLowerCase() },
-        { username: username }
-      ]
-    });
-
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'User with this email or username already exists.',
-        error: 'USER_ALREADY_EXISTS'
-      });
+    // Check for duplicate email or username
+    const exists = await User.findOne({ $or: [{ email: email.toLowerCase() }, { username }] });
+    if (exists) {
+      return res.status(400).json({ success: false, message: 'Email or username already in use.' });
     }
 
-    // Create new user
     const user = new User({
       username,
       email: email.toLowerCase(),
       password,
-      profile: {
-        firstName: firstName || '',
-        lastName: lastName || ''
-      }
+      profile: { firstName: firstName || '', lastName: lastName || '' },
     });
 
     await user.save();
-
-    // Generate token
     const token = generateToken({ id: user._id, role: user.role });
-
-    // Remove password from response
-    user.password = undefined;
 
     res.status(201).json({
       success: true,
-      message: 'User registered successfully.',
-      data: {
-        token,
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          profile: user.profile,
-          createdAt: user.createdAt
-        }
-      }
+      message: 'Account created successfully.',
+      data: { token, user: formatUser(user) },
     });
   } catch (error) {
-    console.error('Registration error:', error);
-    
     if (error.name === 'ValidationError') {
-      const errors = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed.',
-        error: 'VALIDATION_ERROR',
-        details: errors
-      });
+      const details = Object.values(error.errors).map((e) => e.message);
+      return res.status(400).json({ success: false, message: 'Validation failed.', details });
     }
-
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error during registration.',
-      error: 'REGISTRATION_ERROR'
-    });
+    console.error('Register error:', error);
+    res.status(500).json({ success: false, message: 'Server error during registration.' });
   }
 });
 
-// @route   POST /api/auth/login
-// @desc    Login user
-// @access  Public
+// ─── POST /api/auth/login ──────────────────────────────────────────────────
+// Login with email/username + password → returns JWT token
 router.post('/login', loginLimiter, async (req, res) => {
   try {
-    const { identifier, password } = req.body; // identifier can be email or username
+    const { identifier, password } = req.body;
 
-    // Validation
     if (!identifier || !password) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email/username and password are required.',
-        error: 'MISSING_CREDENTIALS'
-      });
+      return res.status(400).json({ success: false, message: 'identifier (email/username) and password are required.' });
     }
 
-    // Find user by email or username
     const user = await User.findByEmailOrUsername(identifier);
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials.',
-        error: 'INVALID_CREDENTIALS'
-      });
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
     }
 
-    // Check if account is locked
     if (user.isLocked) {
-      return res.status(401).json({
-        success: false,
-        message: 'Account is temporarily locked due to too many failed login attempts.',
-        error: 'ACCOUNT_LOCKED'
-      });
+      return res.status(401).json({ success: false, message: 'Account is temporarily locked. Try again later.' });
     }
 
-    // Check if account is active
     if (!user.isActive) {
-      return res.status(401).json({
-        success: false,
-        message: 'Account has been deactivated.',
-        error: 'ACCOUNT_DEACTIVATED'
-      });
+      return res.status(401).json({ success: false, message: 'Account has been deactivated.' });
     }
 
-    // Check password
-    const isPasswordValid = await user.comparePassword(password);
-
-    if (!isPasswordValid) {
-      // Increment login attempts
+    const isValid = await user.comparePassword(password);
+    if (!isValid) {
       await user.incLoginAttempts();
-      
-      return res.status(401).json({
-        success: false,
-        message: 'Invalid credentials.',
-        error: 'INVALID_CREDENTIALS'
-      });
+      return res.status(401).json({ success: false, message: 'Invalid credentials.' });
     }
 
-    // Reset login attempts on successful login
-    if (user.loginAttempts > 0) {
-      await user.resetLoginAttempts();
-    }
-
-    // Update last login
+    // Successful login: reset attempts + update lastLogin
+    if (user.loginAttempts > 0) await user.resetLoginAttempts();
     user.lastLogin = new Date();
     await user.save();
 
-    // Generate token
     const token = generateToken({ id: user._id, role: user.role });
-
-    // Remove password from response
-    user.password = undefined;
 
     res.json({
       success: true,
       message: 'Login successful.',
-      data: {
-        token,
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          profile: user.profile,
-          preferences: user.preferences,
-          lastLogin: user.lastLogin
-        }
-      }
+      data: { token, user: formatUser(user) },
     });
   } catch (error) {
     console.error('Login error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error during login.',
-      error: 'LOGIN_ERROR'
-    });
+    res.status(500).json({ success: false, message: 'Server error during login.' });
   }
 });
 
-// @route   GET /api/auth/profile
-// @desc    Get current user profile
-// @access  Private
+// ─── GET /api/auth/profile ─────────────────────────────────────────────────
+// Get the logged-in user's profile (requires JWT in Authorization header)
 router.get('/profile', authenticate, async (req, res) => {
   try {
     const user = await User.findById(req.user._id);
-
-    res.json({
-      success: true,
-      message: 'Profile retrieved successfully.',
-      data: {
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          profile: user.profile,
-          preferences: user.preferences,
-          lastLogin: user.lastLogin,
-          createdAt: user.createdAt,
-          updatedAt: user.updatedAt
-        }
-      }
-    });
+    res.json({ success: true, data: { user: formatUser(user) } });
   } catch (error) {
     console.error('Profile fetch error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching profile.',
-      error: 'PROFILE_FETCH_ERROR'
-    });
+    res.status(500).json({ success: false, message: 'Error fetching profile.' });
   }
 });
 
-// @route   PUT /api/auth/profile
-// @desc    Update current user profile
-// @access  Private
-router.put('/profile', authenticate, generalLimiter, async (req, res) => {
+// ─── PUT /api/auth/profile ─────────────────────────────────────────────────
+// Update first name, last name, or bio
+router.put('/profile', authenticate, async (req, res) => {
   try {
-    const { profile, preferences } = req.body;
     const user = await User.findById(req.user._id);
+    const { firstName, lastName, bio } = req.body;
 
-    // Update profile fields
-    if (profile) {
-      if (profile.firstName !== undefined) user.profile.firstName = profile.firstName;
-      if (profile.lastName !== undefined) user.profile.lastName = profile.lastName;
-      if (profile.bio !== undefined) user.profile.bio = profile.bio;
-      if (profile.avatar !== undefined) user.profile.avatar = profile.avatar;
-    }
-
-    // Update preferences
-    if (preferences) {
-      if (preferences.theme) user.preferences.theme = preferences.theme;
-      if (preferences.language) user.preferences.language = preferences.language;
-      if (preferences.notifications) {
-        if (preferences.notifications.email !== undefined) {
-          user.preferences.notifications.email = preferences.notifications.email;
-        }
-        if (preferences.notifications.browser !== undefined) {
-          user.preferences.notifications.browser = preferences.notifications.browser;
-        }
-      }
-    }
+    if (firstName !== undefined) user.profile.firstName = firstName;
+    if (lastName !== undefined) user.profile.lastName = lastName;
+    if (bio !== undefined) user.profile.bio = bio;
 
     await user.save();
-
-    res.json({
-      success: true,
-      message: 'Profile updated successfully.',
-      data: {
-        user: {
-          id: user._id,
-          username: user.username,
-          email: user.email,
-          role: user.role,
-          profile: user.profile,
-          preferences: user.preferences
-        }
-      }
-    });
+    res.json({ success: true, message: 'Profile updated.', data: { user: formatUser(user) } });
   } catch (error) {
     console.error('Profile update error:', error);
-    
-    if (error.name === 'ValidationError') {
-      const errors = Object.values(error.errors).map(err => err.message);
-      return res.status(400).json({
-        success: false,
-        message: 'Validation failed.',
-        error: 'VALIDATION_ERROR',
-        details: errors
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: 'Error updating profile.',
-      error: 'PROFILE_UPDATE_ERROR'
-    });
+    res.status(500).json({ success: false, message: 'Error updating profile.' });
   }
 });
 
-// @route   POST /api/auth/change-password
-// @desc    Change user password
-// @access  Private
-router.post('/change-password', authenticate, generalLimiter, async (req, res) => {
+// ─── POST /api/auth/change-password ───────────────────────────────────────
+// Change password (must provide current password to confirm)
+router.post('/change-password', authenticate, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
-
     if (!currentPassword || !newPassword) {
-      return res.status(400).json({
-        success: false,
-        message: 'Current password and new password are required.',
-        error: 'MISSING_PASSWORDS'
-      });
+      return res.status(400).json({ success: false, message: 'currentPassword and newPassword are required.' });
     }
 
     const user = await User.findById(req.user._id).select('+password');
-
-    // Verify current password
-    const isCurrentPasswordValid = await user.comparePassword(currentPassword);
-    if (!isCurrentPasswordValid) {
-      return res.status(400).json({
-        success: false,
-        message: 'Current password is incorrect.',
-        error: 'INVALID_CURRENT_PASSWORD'
-      });
+    const isValid = await user.comparePassword(currentPassword);
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: 'Current password is incorrect.' });
     }
 
-    // Update password
     user.password = newPassword;
     await user.save();
-
-    res.json({
-      success: true,
-      message: 'Password changed successfully.'
-    });
+    res.json({ success: true, message: 'Password changed successfully.' });
   } catch (error) {
-    console.error('Password change error:', error);
-    
-    if (error.name === 'ValidationError') {
-      return res.status(400).json({
-        success: false,
-        message: 'New password validation failed.',
-        error: 'PASSWORD_VALIDATION_ERROR'
-      });
-    }
-
-    res.status(500).json({
-      success: false,
-      message: 'Error changing password.',
-      error: 'PASSWORD_CHANGE_ERROR'
-    });
+    console.error('Change password error:', error);
+    res.status(500).json({ success: false, message: 'Error changing password.' });
   }
 });
 
-// @route   POST /api/auth/api-keys
-// @desc    Generate new API key
-// @access  Private
-router.post('/api-keys', authenticate, generalLimiter, async (req, res) => {
-  try {
-    const { name } = req.body;
-
-    if (!name) {
-      return res.status(400).json({
-        success: false,
-        message: 'API key name is required.',
-        error: 'MISSING_API_KEY_NAME'
-      });
-    }
-
-    const user = await User.findById(req.user._id);
-    const apiKey = user.generateAPIKey();
-
-    user.apiKeys.push({
-      name,
-      key: apiKey,
-      createdAt: new Date(),
-      isActive: true
-    });
-
-    await user.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'API key generated successfully.',
-      data: {
-        apiKey: {
-          name,
-          key: apiKey,
-          createdAt: new Date()
-        }
-      }
-    });
-  } catch (error) {
-    console.error('API key generation error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error generating API key.',
-      error: 'API_KEY_GENERATION_ERROR'
-    });
-  }
-});
-
-// @route   GET /api/auth/api-keys
-// @desc    Get user's API keys
-// @access  Private
-router.get('/api-keys', authenticate, async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    
-    const apiKeys = user.apiKeys.map(key => ({
-      id: key._id,
-      name: key.name,
-      key: key.key.substring(0, 8) + '...' + key.key.substring(key.key.length - 4), // Masked key
-      createdAt: key.createdAt,
-      lastUsed: key.lastUsed,
-      isActive: key.isActive
-    }));
-
-    res.json({
-      success: true,
-      message: 'API keys retrieved successfully.',
-      data: { apiKeys }
-    });
-  } catch (error) {
-    console.error('API keys fetch error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching API keys.',
-      error: 'API_KEYS_FETCH_ERROR'
-    });
-  }
-});
-
-// @route   DELETE /api/auth/api-keys/:keyId
-// @desc    Delete API key
-// @access  Private
-router.delete('/api-keys/:keyId', authenticate, async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    
-    user.apiKeys = user.apiKeys.filter(
-      key => key._id.toString() !== req.params.keyId
-    );
-
-    await user.save();
-
-    res.json({
-      success: true,
-      message: 'API key deleted successfully.'
-    });
-  } catch (error) {
-    console.error('API key deletion error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error deleting API key.',
-      error: 'API_KEY_DELETION_ERROR'
-    });
-  }
-});
-
-// @route   POST /api/auth/logout
-// @desc    Logout user (mainly for token blacklisting if implemented)
-// @access  Private
+// ─── POST /api/auth/logout ─────────────────────────────────────────────────
+// Stateless JWT — client just deletes the token. This endpoint confirms it.
 router.post('/logout', authenticate, (req, res) => {
-  // In a stateless JWT system, logout is handled client-side by removing the token
-  // Here you could implement token blacklisting if needed
-  res.json({
-    success: true,
-    message: 'Logout successful.'
-  });
+  res.json({ success: true, message: 'Logged out successfully. Please delete your token on the client side.' });
 });
+
+
+// ─── Helper ───────────────────────────────────────────────────────────────
+// Return a clean user object without sensitive fields
+function formatUser(user) {
+  return {
+    id: user._id,
+    username: user.username,
+    email: user.email,
+    role: user.role,
+    profile: user.profile,
+    lastLogin: user.lastLogin,
+    createdAt: user.createdAt,
+  };
+}
 
 export default router;
